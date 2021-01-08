@@ -20,6 +20,6 @@ FROM alpine:3.9
 
 RUN apk add --no-cache ca-certificates
 
-COPY --from=build /workspace/webhook /usr/local/bin/webhook
+COPY --from=build /workspace/webhook-infoblox /usr/local/bin/webhook-infoblox
 
-ENTRYPOINT ["webhook"]
+ENTRYPOINT ["webhook-infoblox"]

@@ -1,16 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
+	"github.com/pkg/errors"
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	//"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog"
 
+	"github.com/infobloxopen/infoblox-go-client"
 	"github.com/jetstack/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 	"github.com/jetstack/cert-manager/pkg/acme/webhook/cmd"
+	apis "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
@@ -41,7 +49,7 @@ type customDNSProviderSolver struct {
 	// 3. uncomment the relevant code in the Initialize method below
 	// 4. ensure your webhook's service account has the required RBAC role
 	//    assigned to it for interacting with the Kubernetes APIs you need.
-	//client kubernetes.Clientset
+	client *kubernetes.Clientset
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -63,9 +71,12 @@ type customDNSProviderConfig struct {
 	// to be decoded.
 	// These fields will be set by users in the
 	// `issuer.spec.acme.dns01.providers.webhook.config` field.
-
-	//Email           string `json:"email"`
-	//APIKeySecretRef v1alpha1.SecretKeySelector `json:"apiKeySecretRef"`
+	Host              string                 `json:"host"`
+	Port              string                 `json:"port"`
+	Version           string                 `json:"version"`
+	SSLVerify         bool                   `json:"sslVerify"`
+	UsernameSecretRef apis.SecretKeySelector `json:"userNameSecretRef"`
+	PasswordSecretRef apis.SecretKeySelector `json:"passwordSecretRef"`
 }
 
 // Name is used as the name for this DNS solver when referencing it on the ACME
@@ -75,7 +86,15 @@ type customDNSProviderConfig struct {
 // within a single webhook deployment**.
 // For example, `cloudflare` may be used as the name of a solver.
 func (c *customDNSProviderSolver) Name() string {
-	return "my-custom-solver"
+	return "infoblox-solver"
+}
+
+func (c *customDNSProviderSolver) getDomainAndEntry(ch *v1alpha1.ChallengeRequest) (string, string) {
+	// Both ch.ResolvedZone and ch.ResolvedFQDN end with a dot: '.'
+	entry := strings.TrimSuffix(ch.ResolvedFQDN, ch.ResolvedZone)
+	entry = strings.TrimSuffix(entry, ".")
+	domain := strings.TrimSuffix(ch.ResolvedZone, ".")
+	return entry, domain
 }
 
 // Present is responsible for actually presenting the DNS record with the
@@ -89,10 +108,47 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
-	// TODO: do something more useful with the decoded configuration
-	fmt.Printf("Decoded configuration %v", cfg)
+	klog.Infof("Decoded configuration %v", cfg)
 
-	// TODO: add code that sets a record in the DNS provider's console
+	entry, domain := c.getDomainAndEntry(ch)
+	klog.Infof("present for entry=%s, domain=%s", entry, domain)
+
+	klog.Infof("Presenting txt record: %v %v", ch.ResolvedFQDN, ch.ResolvedZone)
+
+	// Code that sets a record in the DNS provider's console
+
+	client, err := c.getClient(&cfg, ch.ResourceNamespace)
+
+	if err != nil {
+		klog.Errorf("unable to get client: %s", err)
+		return err
+	}
+
+	rt := ibclient.NewRecordTXT(ibclient.RecordTXT{Name: entry})
+
+	var records []ibclient.RecordTXT
+	err = client.GetObject(rt, "", &records)
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range records {
+		if rec.Text == ch.Key {
+			return nil
+		}
+	}
+
+	rt = ibclient.NewRecordTXT(ibclient.RecordTXT{
+		Name: entry,
+		Text: ch.Key})
+
+	ref, err := client.CreateObject(rt)
+	if err != nil {
+		return err
+	}
+
+	klog.Infof("INFOBLOX: created TXT record %v, %s -> %s", rt, ch.Key, ref)
+
 	return nil
 }
 
@@ -103,7 +159,52 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // This is in order to facilitate multiple DNS validations for the same domain
 // concurrently.
 func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	// TODO: add code that deletes a record from the DNS provider's console
+	cfg, err := loadConfig(ch.Config)
+	if err != nil {
+		return err
+	}
+
+	klog.Infof("Decoded configuration %v", cfg)
+
+	entry, domain := c.getDomainAndEntry(ch)
+	klog.Infof("present for entry=%s, domain=%s", entry, domain)
+
+	// Code that deletes a record from the DNS provider's console
+
+	client, err := c.getClient(&cfg, ch.ResourceNamespace)
+
+	if err != nil {
+		klog.Errorf("unable to get client: %s", err)
+		return err
+	}
+
+	rt := ibclient.NewRecordTXT(ibclient.RecordTXT{Name: entry})
+
+	var records []ibclient.RecordTXT
+	err = client.GetObject(rt, "", &records)
+	if err != nil {
+		return err
+	}
+
+	var ref string
+	for _, rec := range records {
+		if rec.Text == ch.Key {
+			ref = rec.Ref
+			break
+		}
+	}
+
+	if len(ref) == 0 {
+		return nil
+	}
+
+	_, err = client.DeleteObject(ref)
+	if err != nil {
+		return err
+	}
+
+	klog.Infof("INFOBLOX: deleting TXT record %s, %s -> %s", domain, ch.Key, ref)
+
 	return nil
 }
 
@@ -120,12 +221,12 @@ func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stop
 	///// UNCOMMENT THE BELOW CODE TO MAKE A KUBERNETES CLIENTSET AVAILABLE TO
 	///// YOUR CUSTOM DNS PROVIDER
 
-	//cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//c.client = cl
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
+
+	c.client = cl
 
 	///// END OF CODE TO MAKE KUBERNETES CLIENTSET AVAILABLE
 	return nil
@@ -144,4 +245,58 @@ func loadConfig(cfgJSON *extapi.JSON) (customDNSProviderConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func (c *customDNSProviderSolver) getClient(cfg *customDNSProviderConfig, namespace string) (ibclient.IBConnector, error) {
+
+	userName, err := c.getSecretData(cfg.UsernameSecretRef, namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	password, err := c.getSecretData(cfg.PasswordSecretRef, namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	hostConfig := ibclient.HostConfig{
+		Host:     cfg.Host,
+		Port:     cfg.Port,
+		Username: string(userName),
+		Password: string(password),
+		Version:  cfg.Version,
+	}
+
+	httpPoolConnections := 10
+	httpRequestTimeout := 60
+
+	transportConfig := ibclient.NewTransportConfig(
+		strconv.FormatBool(cfg.SSLVerify),
+		httpRequestTimeout,
+		httpPoolConnections,
+	)
+
+	requestBuilder := &ibclient.WapiRequestBuilder{}
+	requestor := &ibclient.WapiHttpRequestor{}
+
+	client, err := ibclient.NewConnector(hostConfig, transportConfig, requestBuilder, requestor)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (c *customDNSProviderSolver) getSecretData(selector apis.SecretKeySelector, ns string) ([]byte, error) {
+
+	secret, err := c.client.CoreV1().Secrets(ns).Get(context.Background(), selector.Name, metav1.GetOptions{})
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load secret %q", ns+"/"+selector.Name)
+	}
+
+	if data, ok := secret.Data[selector.Key]; ok {
+		return data, nil
+	}
+
+	return nil, errors.Errorf("no key %q in secret %q", selector.Key, ns+"/"+selector.Name)
 }
